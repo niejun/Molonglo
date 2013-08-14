@@ -37,6 +37,7 @@ import sys
 import copy
 import threading
 import eventlet
+from eventlet.green import socket
 import lxml.etree as et
 import lxml as xml
 
@@ -60,8 +61,7 @@ MOL_ELE_M = 735.031
 # Pulsar list files
 DEFAULT_PULSAR_TXT_FILE = '.'+os.sep+'mol_pulsars.txt'
 DEFAULT_PULSAR_DB_FILE = '.'+os.sep+'mol_pulsars.db'
-DEFAULT_OBS_DB_FILE = '.'+os.sep+'mod_obs.db'
-
+DEFAULT_STATUS_TXT_FILE = '.'+os.sep+'mol_status.txt'
 # Slew rate, degrees per second
 EW_SLEW_RATE = 4.0 / 60.0
 NS_SLEW_RATE = 5.0 / 60.0
@@ -71,6 +71,15 @@ E_LIMIT = 15.0
 W_LIMIT = -15.0
 N_LIMIT = 53.37
 S_LIMIT = -90.0
+
+# MOPSR IP and Port
+MOPSR_IP = '127.0.0.1'
+MOPSR_PORT = 6000
+
+# TCC IP and Port
+TCC_IP = 'localhost'
+TCC_PORT = 6001
+
 
 # Default date(seconds from 1970) for overall observatory
 DATE = time.time()
@@ -85,16 +94,26 @@ pulsarlist = {}
 pulsarposition = []
 slewtable = {}
 joblist = []
-running = False
+running = True
 gui_in_buffer = ''
 gui_out_status_buffer = ''
 gui_out_pulsar_buffer = ''
 gui_out_obslist_buffer = ''
-schedule_mode = 'manual'
-antenna_status = 'parked'
-mpsr_status = 'no response'
-tcc_status = 'no response'
-
+# manual, automatic
+scheduler_mode = 'manual'
+# parked, slewing, tracking
+antenna_status = 'None'
+# not_connect, ready, recording
+mopsr_status = 'not_connect'
+# not_connect, ready, tracking, slewing
+tcc_status = 'not_connect'
+# degree
+antenna_position_ewd = 0.0
+antenna_position_nsd = 0.0
+message_to_mopsr = ''
+message_from_mopsr = ''
+message_to_tcc = ''
+message_from_tcc = ''
 
 ########################
 ##  Public Functions  ##
@@ -115,9 +134,11 @@ def dbg(string):
     print '[DBG-%s]  '% nowtime() + string
 
 # D2 for output information
-def out(string):
-  if OUT == True:
+def out(string, newline=True):
+  if OUT == True and newline:
     print '[OUT-%s]  '% nowtime() + string
+  if OUT == True and newline == False:
+    print string,
 
 def ewr(az, ze):
   return np.arcsin(np.sin(az)*np.sin(ze))
@@ -195,33 +216,46 @@ def decdeg2rad(deg):
 
 
 class LiteSQL():
-  def __init__(self, txt=DEFAULT_PULSAR_TXT_FILE, db=DEFAULT_PULSAR_DB_FILE):
+  def __init__(self, txt=DEFAULT_PULSAR_TXT_FILE, status=DEFAULT_STATUS_TXT_FILE, db=DEFAULT_PULSAR_DB_FILE):
     self.txt = txt
     self.db = db
+    self.status = status
     self.con = None
     self.cur = None
-    self.litecheckdb(self.db)
-    self.litereadpulsarlist(self.db)
+    self.checkdb()
+    self.readpulsarlist()
 
-  def litecheckdb(self, db):
+  def checkdb(self):
     exist = False
-    if os.path.isfile(db):
+    if os.path.isfile(self.db):
       exist = True
-      out('Database file %s exists'% db)
-    self.con = lite.connect(db)
+      out('Database file %s exists'% self.db)
+    self.con = lite.connect(self.db)
     self.cur = self.con.cursor()
     if exist == False:
+      # Pulsar List
       createtable = 'create table PulsarList(jname text primary key, raj text,decj text, s843 real, p0 real, w50 real, dm real, points_gain real, points_fail real, gap_min real, gap_max real, snr_min real, snr_min_tobs_max real, snr_max real )'
-      self.litequery(createtable,db)
+      self.query(createtable)
+      # Observing Log
       createtable = 'create table PulsarLog(jname text, tstart int, tobs int, succeed int, points int, snr real)'
-      self.litequery(createtable,db)
-      createtable = 'create table PulsarJobs(jname text, tstart int, tobs int)'
-      self.litequery(createtable,db)
-      out('Database file %s not exists, created'% db)
-      self.litetestdata(db)
-      self.liteinitpulsarlist(self.txt, db)
+      self.query(createtable)
+      # Observing List
+      createtable = 'create table PulsarJobList(jname text, tstart int, tobs int)'
+      self.query(createtable)
+      # Statuses and Commands
+      createtable = 'create table Status(name text, taken int, scheduler_mode text, antenna_status text, antenna_position_ewd real, antenna_position_nsd real, mopsr_status text, tcc_status text, running int)'
+      self.query(createtable)
 
-  def litequery(self, sql, db):
+      # System information
+      createtable = 'create table System(mopsr_ip text, mopsr_port int, tcc_ip text, tcc_port int)'
+      self.query(createtable)
+
+      out('Database file %s not exists, created'% self.db)
+      self.testdata()
+      self.initpulsarlist()
+      self.initstatus()
+
+  def query(self, sql):
     if self.con != None:
       self.cur.execute(sql)
       res = self.cur.fetchall()
@@ -231,16 +265,16 @@ class LiteSQL():
       out('Database not exists, please check')
 
 
-  def litetestdata(self, db):
-    self.litequery("insert into PulsarList values('JTEST','12:00:00','45:00:00',34.56,12.3,4.32,126.7,100,-200,1,3,20,60,100)", db)
-    res = self.litequery("select * from PulsarList where jname='JTEST'", db)
+  def testdata(self):
+    self.query("insert into PulsarList values('JTEST','12:00:00','45:00:00',34.56,12.3,4.32,126.7,100,-200,1,3,20,60,100);")
+    res = self.query("select * from PulsarList where jname='JTEST';")
     for row in res:
       print 'Test data:'
       print row
-    self.litequery("delete from PulsarList where jname='JTEST'", db)
+    self.query("delete from PulsarList where jname='JTEST'")
 
-  def liteinitpulsarlist( self, txt, db):
-    f = file(txt)
+  def initpulsarlist(self):
+    f = file(self.txt)
     while True:
       line = f.readline()
       if len(line)!=0:
@@ -251,19 +285,43 @@ class LiteSQL():
         templist[-1] = templist[-1].replace('\n','')
         sql = "insert into PulsarList values('"+templist[0]+"','"+templist[1]+"','"+templist[2]+"',"+str(templist[3])+","+str(templist[4])+","+str(templist[5])+","+str(templist[6])+","+str(templist[7])+","+str(templist[8])+","+str(templist[9])+","+str(templist[10])+","+str(templist[11])+","+str(templist[12])+","+str(templist[13])+");"
         #dbg(sql)
-        self.litequery(sql, db)
+        self.query(sql)
         dbg('Loaded pulsar: '+templist[0])
       else:
         break
 
-  def litereadpulsarlist(self, db):
-    rows = self.litequery('select * from PulsarList', db)
+  def initstatus(self):
+    f = file(self.status)
+    while True:
+      line = f.readline()
+      if len(line)!=0:
+        if line[0]=='#':
+          continue
+        templist = line.replace('*','NULL')
+        templist = templist.split(' ')
+        templist[-1] = templist[-1].replace('\n','')
+        sql = "insert into Status values('"+templist[0]+"',"+str(templist[1])+",'"+templist[2]+"','"+templist[3]+"',"+str(templist[4])+","+str(templist[5])+",'"+templist[6]+"','"+templist[7]+"');"
+        dbg(sql)
+        self.query(sql)
+        dbg('Loaded status: '+templist[0])
+      else:
+        break
+
+  def readpulsarlist(self):
+    rows = self.query('select * from PulsarList;')
     for row in rows:
       pulsarlist[str(row[0])] = [str(row[1]), str(row[2]), row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11], row[12], row[13] ]
+
+  def update(self, table, column, value,wherecolumn, wherevalue):
+    sql = "update "+ table + " set " + column + "='" + value + "' where " + wherecolumn + "='" + wherevalue + "';"
+    self.query(sql)
+    dbg(sql)
 
   def __del__(self):
     self.con.commit()
     self.con.close()
+
+
 
 
 #########################################################################################
@@ -467,136 +525,169 @@ def getCurrentPosition():
   # TODO: connect to TCC
   return SimplePoint(0.0,0.0)
 
-def sendMessageToMPSR(msg):
+def sendMessageToMOPSR(msg):
   out('Send to MOPSR: %s'%msg)
+  return msg
   
 
-def getMessageFromMPSR(msg):
+def getMessageFromMOPSR(msg):
   out('Get from MOPSR: %s'%msg)
+  return msg
   
 def sendMessageToTCC(msg):
   out('Send to TCC: %s'%msg)
+  return msg
 
 def getMessageFromTCC(msg):
   out('Get from TCC: %s'%msg)
-
-class Server(threading.Thread):
-  def __init__(self):
-    threading.Thread.__init__(self)
-    self.server = eventlet.listen(('0.0.0.0', 6000))
-    self.pool = eventlet.GreenPool()
-
-  def run(self):
-    while True:
-      try:
-          new_sock, address = self.server.accept()
-          print "accepted", address
-          self.pool.spawn_n(self.handle, new_sock.makefile('rw'))
-      except (SystemExit, KeyboardInterrupt):
-          break
-  
-  def handle(self,fd):
-    print "client connected"
-    global gui_in_buffer, gui_out_status_buffer
-    while True:
-        # pass through every non-eof line
-        gui_in_buffer = fd.readline()
-        if not gui_in_buffer: break
-        if gui_out_status_buffer != '':
-          fd.write(gui_out_status_buffer)
-          fd.flush()
-          gui_out_status_buffer = ''
-        #fd.write(gui_in_buffer)
-        #fd.flush()
-        #print "echoed", gui_in_buffer,
-    print "client disconnected"
-
-class Server_2(threading.Thread):
-  def __init__(self):
-    threading.Thread.__init__(self)
-    self.gui_in_buffer = ''
-    self.gui_out_buffer = ''
-  
-  def run(self):
-    global gui_in_buffer, schedule_mode, gui_out_status_buffer
-    while True:
-      try:
-        if gui_in_buffer != self.gui_in_buffer:
-          dbg('New data come in')
-          self.gui_in_buffer = gui_in_buffer
-          gui_out_status_buffer = ''
-          tempdom = et.Element('Molonglo')
-          dtree = et.fromstring(self.gui_in_buffer)
-          if dtree.tag != 'Molonglo':
-            continue
-          for i in dtree:
-            if i.tag == 'query':
-              for j in i:
-                if j.tag == 'schedule_mode':
-                  a00 = et.SubElement(tempdom, j.tag)
-                  a00.text = schedule_mode
-
-            if i.tag == 'set':
-              for j in i:
-                if j.tag == 'schedule_mode':
-                  schedule_mode = j.text
-                  a00 = et.SubElement(tempdom, j.tag)
-                  a00.text = schedule_mode
-          gui_out_status_buffer = et.tostring(tempdom)
-          dbg(et.tostring(tempdom))
-        time.sleep(1)
-      except(et.LxmlError):
-        out('Error with XML parsing%s'%et.LxmlError.message)
+  return msg
 
 class Scheduler():
   def __init__(self):
-    global antenna_status, schedule_mode, mpsr_status, tcc_status
-    self.obs = Molonglo()
-    # antenna status: 1:parked, 2:idle, 3:slewing, 4:tracking
-    self.antenna_status = antenna_status
-    # scheduler mode: 1 Manual, 2 Auto
-    self.schedule_mode = schedule_mode
-    # GUI mode: 1:Local pyplot, 2:Remote web
-    self.gui_mode = 'remote web'
-    # MPSR and TCC status, 1:no response, 2:connected, 3:idle, 4:prepared, 5:started, 6:stopped
-    self.mpsr_status = mpsr_status
-    self.tcc_status = tcc_status
-    self.observing_list = {}
-    self.gui_in_buffer = ''
-    self.server = Server()
-    self.server.start()
-    self.server_2 = Server_2()
-    self.server_2.start()
+    self.db = LiteSQL()
+    global pulsarlist, joblist, running, scheduler_mode, antenna_status, mopsr_status, tcc_status, antenna_position_ewd, antenna_position_nsd
+    global message_to_mopsr,message_from_mopsr,message_to_tcc,message_from_tcc
+    self.systemstatus = False
+    self.systemtest()
+    self.observatory = Molonglo()
+    self.client = Client()
+    self.client.start()
     while True:
-      #print 'In main loop', 
-      #if self.gui_in_buffer != None or len(self.gui_in_buffer)!=0:
-      global gui_in_buffer
-      self.gui_in_buffer = gui_in_buffer
-      self.schedule_mode = schedule_mode
-      #print self.gui_in_buffer, len(self.gui_in_buffer)
-      out('Schedule Mode %s'%self.schedule_mode)
-      time.sleep(3)
+      if running:
+        if scheduler_mode == 'manual':
+          while self.systemstatus:
+            if len(joblist)!=0:
+              if running:
+                source = joblist[0]
+                joblist.remove(source)
+                curp = SimplePoint(antenna_position_ewd, antenna_position_nsd)
+                t_timetable = gotime(curp, self.observatory)
+                t_sourcet = t_timetable[source][0] / 60.0
+                t_dest = t_timetable[source][1]
+                out('Begin observing schedule on %s'%source)
+                sendMessageToTCC('Move to %s'%(str(t_dest.ewd)+str(t_dest.nsd) ))
+                out('Antenna is slewing')
+                #while tcc_status!='tracking':
+                #  out('.', False)
+                #  time.sleep(1)
+                sendMessageToMOPSR('recording')
+                mopsr_status = 'recording'
+                out('MOPSR is preparing')
+                while mopsr_status!='recording':
+                  out('.', False)
+                  time.sleep(1)
+                out('Observing')
+                temptobs = int(t_timetable[source][3])+20
+                while self.systemstatus and temptobs > 0:
+                  out('.', False)
+                  self.systemtest()
+                  temptobs = temptobs - 1
+                  time.sleep(1)
+              else:
+                out('Scheduler is stopped by hand')
+                break
+            else:
+              out('Job list is empty')
+              time.sleep(1)
+          out('Something wrong with the system')
+        elif scheduler_mode == 'automatic':
+          pass
+        time.sleep(1)
+        self.systemtest()
+      else:
+        out('Scheduler is stopped, rest for 1 second')
+        time.sleep(1)
+
+  
 
 
+  def systemtest(self):
 
-    run(self)
+    if tcc_status!='not_connect':
+      if mopsr_status!='not_connect':
+        if running:
+          self.systemstatus = True
+        else:
+          self.systemstatus = False
+          out('The scheduler is not running')
+      else:
+        self.systemstatus = False
+        out('MOPSR status wrong:%s'%mopsr_status)
+    else:
+      self.systemstatus = False
+      out('TCC status wrong: %s'%antenna_status)
 
-  def prepare(self):
-    pass
 
+class Client(threading.Thread):
+  def __init__(self):
+    global mopsr_status, tcc_status
+    threading.Thread.__init__(self)
+    #self.pile = eventlet.GreenPile()
+    self.mopsr_con = socket.socket()
+    ip = socket.gethostbyname(MOPSR_IP)
+    self.mopsr_con.connect((ip, MOPSR_PORT))
+    self.fd = self.mopsr_con.makefile('rw')
+    mopsr_status = 'ready'
+    tcc_status = 'ready'
+    self.mopsr_status = mopsr_status
 
   def run(self):
-    # Manual
-    if self.sch_mode == 1:
-      pass
+    global message_to_mopsr,message_from_mopsr,message_to_tcc,message_from_tcc
+    global mopsr_status
+    while True:
+      if self.mopsr_status != mopsr_status:
+        out('MOPSR status changed from %s to %s'%(self.mopsr_status, mopsr_status))
+        message_to_mopsr = XMLWriter('mopsr','set',{'status':mopsr_status})
+        dbg('Send message to MOPSR%s'%message_to_mopsr)
 
-    # Auto
-    elif self.sch_mode ==2:
-      pass
+        self.fd.write(message_to_mopsr)
+        self.fd.flush()
+
+        message_to_mopsr = XMLWriter('mopsr','query',{'status':''})
+        dbg('Send message to MOPSR%s'%message_to_mopsr)
+
+        self.fd.write(message_to_mopsr)
+        self.fd.flush()
+
+        message_from_mopsr = self.fd.readline()
+
+        dbg('Get message from MOPSR%s'%message_from_mopsr)
+        result = XMLReader('mopsr')
+        
+        if result['status'] != mopsr_status:
+          mopsr_status = self.mopsr_status
+        else:
+          self.mopsr_status = mopsr_status
+      else:
+        time.sleep(0.1)
 
 
-  def handlexml(self, xml):
+
+
+def XMLReader(who):
+  result = {}
+  if who == 'mopsr':
+    tmpdom = et.fromstring(message_from_mopsr)
+    if tmpdom.tag == 'Molonglo':
+      for i in tmpdom:
+        if i.tag == who:
+          for j in i:
+            result[j.tag] = j.text
+  return result
+
+  if who == 'tcc':
     pass
+
+
+def XMLWriter(who, action, attr):
+  if who =='mopsr':
+    tmpdom = et.Element('Molonglo')
+    a00 = et.SubElement(tmpdom, who)
+    a01 = et.SubElement(a00, action)
+    for i in attr.keys():
+      a02 = et.SubElement(a01, i)
+      a02.text = attr[i]
+    return et.tostring(tmpdom)
 
 
 """
@@ -762,6 +853,7 @@ if __name__ == '__main__':
 
   #joblist = ['J0437-4715', 'J0738-4042', 'J0835-4510', 'J0953+0755', 'J1136+1551', 'J1456-6843', 'J1559-4438', 'J1644-4559', 'J1932+1059', 'J1935+1616']
   #joblist = ['J1456-6843', 'J1559-4438']
+  joblist = ['J0835-4510']
 
   Scheduler()
 
