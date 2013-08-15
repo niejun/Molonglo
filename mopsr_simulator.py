@@ -115,11 +115,11 @@ class Server(threading.Thread):
     global in_buffer, out_buffer, mopsr_status
     while True:
         # pass through every non-eof line
-        out('Waiting for incoming data')
+        #out('Waiting for incoming data')
         in_buffer = fd.readline()
-        out('In buffer: %s'%in_buffer)
+        #out('In buffer: %s'%in_buffer)
         if not in_buffer: break
-        dbg(in_buffer)
+        #dbg(in_buffer)
         try:
           out_buffer = ''
           tempdom = et.Element('Molonglo')
@@ -136,17 +136,18 @@ class Server(threading.Thread):
                       a01 = et.SubElement(a00, k.tag)
                       a01.text = mopsr_status
                   out_buffer = et.tostring(tempdom)
-                  dbg(et.tostring(tempdom))
+                  #dbg(et.tostring(tempdom))
                 if j.tag == 'set':
                   for k in j:
                     if k.tag == 'status':
                       mopsr_status = k.text
+                      dbg('MOPSR status changes to %s'%k.text)
 
         except(et.LxmlError):
           out('Error with XML parsing%s'%et.LxmlError.message)
         if out_buffer != '':
-          dbg(out_buffer)
-          fd.write(out_buffer)
+          #dbg(out_buffer)
+          fd.write(out_buffer+'\n')
           fd.flush()
 
     print "client disconnected"
@@ -158,11 +159,13 @@ class Interactive(threading.Thread):
   def run(self):
     global mopsr_status
     while True:
+      
       if mopsr_status == 'ready':
         time.sleep(1)
         continue
       if mopsr_status == 'recording':
-        time.sleep(20)
+        time.sleep(1)
+      if mopsr_status =='finish':
         mopsr_status = 'ready'
         continue
 

@@ -80,6 +80,8 @@ MOPSR_PORT = 6000
 TCC_IP = 'localhost'
 TCC_PORT = 6001
 
+# Saved PNG file resolution
+PNG_DPI = 150
 
 # Default date(seconds from 1970) for overall observatory
 DATE = time.time()
@@ -93,6 +95,7 @@ DATE = time.time()
 pulsarlist = {}
 pulsarposition = []
 slewtable = {}
+pulsarstatus = {}
 joblist = []
 running = True
 gui_in_buffer = ''
@@ -230,7 +233,7 @@ class LiteSQL():
     if os.path.isfile(self.db):
       exist = True
       out('Database file %s exists'% self.db)
-    self.con = lite.connect(self.db)
+    self.con = lite.connect(self.db, check_same_thread = False)
     self.cur = self.con.cursor()
     if exist == False:
       # Pulsar List
@@ -250,6 +253,10 @@ class LiteSQL():
       createtable = 'create table System(mopsr_ip text, mopsr_port int, tcc_ip text, tcc_port int)'
       self.query(createtable)
 
+      # Pulsars overhead status
+      createtable = 'create table PulsarStatus(jname text, ewd real, nsd real)'
+      self.query(createtable)
+
       out('Database file %s not exists, created'% self.db)
       self.testdata()
       self.initpulsarlist()
@@ -259,6 +266,7 @@ class LiteSQL():
     if self.con != None:
       self.cur.execute(sql)
       res = self.cur.fetchall()
+      self.con.commit()
       #dbg('Query %s'% sql)
       return res
     else:
@@ -300,7 +308,7 @@ class LiteSQL():
         templist = line.replace('*','NULL')
         templist = templist.split(' ')
         templist[-1] = templist[-1].replace('\n','')
-        sql = "insert into Status values('"+templist[0]+"',"+str(templist[1])+",'"+templist[2]+"','"+templist[3]+"',"+str(templist[4])+","+str(templist[5])+",'"+templist[6]+"','"+templist[7]+"');"
+        sql = "insert into Status values('"+templist[0]+"',"+str(templist[1])+",'"+templist[2]+"','"+templist[3]+"',"+str(templist[4])+","+str(templist[5])+",'"+templist[6]+"','"+templist[7]+"','"+templist[8]+"');"
         dbg(sql)
         self.query(sql)
         dbg('Loaded status: '+templist[0])
@@ -318,6 +326,7 @@ class LiteSQL():
     dbg(sql)
 
   def __del__(self):
+    dbg('LiteSQL delete')
     self.con.commit()
     self.con.close()
 
@@ -544,14 +553,18 @@ def getMessageFromTCC(msg):
 
 class Scheduler():
   def __init__(self):
-    self.db = LiteSQL()
+
     global pulsarlist, joblist, running, scheduler_mode, antenna_status, mopsr_status, tcc_status, antenna_position_ewd, antenna_position_nsd
     global message_to_mopsr,message_from_mopsr,message_to_tcc,message_from_tcc
+    self.db = LiteSQL()
+    print 'Scheduler DB: ',self.db
     self.systemstatus = False
     self.systemtest()
     self.observatory = Molonglo()
     self.client = Client()
     self.client.start()
+    self.drawmap = DrawMap(self.observatory, self.db)
+    self.drawmap.start()
     while True:
       if running:
         if scheduler_mode == 'manual':
@@ -579,10 +592,11 @@ class Scheduler():
                 out('Observing')
                 temptobs = int(t_timetable[source][3])+20
                 while self.systemstatus and temptobs > 0:
-                  out('.', False)
+                  out('.')
                   self.systemtest()
                   temptobs = temptobs - 1
                   time.sleep(1)
+                mopsr_status = 'finish'
               else:
                 out('Scheduler is stopped by hand')
                 break
@@ -626,7 +640,7 @@ class Client(threading.Thread):
     self.mopsr_con = socket.socket()
     ip = socket.gethostbyname(MOPSR_IP)
     self.mopsr_con.connect((ip, MOPSR_PORT))
-    self.fd = self.mopsr_con.makefile('rw')
+    #self.fd = self.mopsr_con.makefile('rw')
     mopsr_status = 'ready'
     tcc_status = 'ready'
     self.mopsr_status = mopsr_status
@@ -638,22 +652,16 @@ class Client(threading.Thread):
       if self.mopsr_status != mopsr_status:
         out('MOPSR status changed from %s to %s'%(self.mopsr_status, mopsr_status))
         message_to_mopsr = XMLWriter('mopsr','set',{'status':mopsr_status})
-        dbg('Send message to MOPSR%s'%message_to_mopsr)
 
-        self.fd.write(message_to_mopsr)
-        self.fd.flush()
+        self.mopsr_con.sendall(message_to_mopsr+'\n')
 
         message_to_mopsr = XMLWriter('mopsr','query',{'status':''})
-        dbg('Send message to MOPSR%s'%message_to_mopsr)
 
-        self.fd.write(message_to_mopsr)
-        self.fd.flush()
+        self.mopsr_con.sendall(message_to_mopsr+'\n')
 
-        message_from_mopsr = self.fd.readline()
-
-        dbg('Get message from MOPSR%s'%message_from_mopsr)
+        message_from_mopsr = self.mopsr_con.recv(8192).strip()
         result = XMLReader('mopsr')
-        
+        dbg('Get message from MOPSR%s'%result['status'])        
         if result['status'] != mopsr_status:
           mopsr_status = self.mopsr_status
         else:
@@ -689,50 +697,17 @@ def XMLWriter(who, action, attr):
       a02.text = attr[i]
     return et.tostring(tmpdom)
 
+class JobListDealer(threading.Thread):
+  def __init__(self, db):
+    threading.Thread.__init__(self)
+    global joblist
+    self.db = db
+    self.joblist = joblist
 
-"""
-def Scheduler(observatory=Molonglo(), mode='manual' ):
-  dbg('Begin Scheduler')
-  if mode == 'manual':
-  # TODO Manually controlling
-
-    while running:
-      if len(joblist) <= 0:
-        out('-----------------Waiting-----------------')
-        out('Jobslist is empty, sleep for 10 seconds, waiting job')
-        time.sleep(10)
-        continue
-      #out(joblist)
-      out('-----------------NEW OBSERVATION-----------------')
-      curp = getCurrentPosition()
-      source = joblist[0]
-      joblist.remove(source)
-      t_timetable = gotime(curp, observatory)
-      t_sourcet = t_timetable[source][0] / 60.0
-      t_dest = t_timetable[source][1]
-      out('Begin observing schedule on %s'%source)
-      out('Move telescope from %s to %s in %f minutes'%(str(curp.ewd)+str(curp.nsd), str(t_dest.ewd)+str(t_dest.nsd) , round(t_sourcet,2)))
-      sendMessageToTCC('move to %s'%(str(t_dest.ewd)+str(t_dest.nsd) ))
-      time.sleep(t_sourcet*60.0/60.0)
-      out('Pretend to have %f minutes sleep for slewing'%t_sourcet)
-      getMessageFromTCC('slew finished')
-      sendMessageToTCC('Track')
-      getMessageFromTCC('Tracking')
-      sendMessageToMPSR('Prepare')
-      getMessageFromMPSR('Prepared')
-      sendMessageToMPSR('Start')
-      getMessageFromMPSR('Started')
-      time.sleep(t_timetable[source][3]*60/60)
-      out('Pretend to have %f minutes sleep for observation'%t_timetable[source][3])
-      sendMessageToMPSR('Stop')
-      getMessageFromMPSR('Stopped')
+  def run(self):
+    global joblist
+    while True:
       
-      
-  else:
-  # TODO Automatically controlling
-    pass
-"""
-
 
 def keycommand(event):
   print 'Key pressed:', event.key, event.xdata, event.ydata 
@@ -756,6 +731,58 @@ def makejoblist(event):
       print 'Pulsar is:%s'%key
       joblist.append(key)
   print 'Point: ', zip(xdata[ind], ydata[ind])
+
+
+class DrawMap(threading.Thread):
+  def __init__(self, obs, db):
+    threading.Thread.__init__(self)
+    self.obs = obs
+    self.db = db
+    print 'DrawMap DB: ',self.db
+    self.fig = plt.figure(figsize=(12,10))
+    self.ax = plt.axes([0.05,0.05,0.9,0.9])
+    self.ax.set_aspect(1)
+
+
+
+  def run(self):
+    global running, pulsarstatus
+    while True:
+      if running:
+        
+        self.ax.cla()
+        self.ax.axis('equal')
+        self.ax.axis([-90,90 ,-90,60])
+        self.ax.grid(True)
+        self.ax.set_title('Pulsars over Molonglo @ '+nowtime(DATE))
+        self.ax.set_xlabel('East west degrees')
+        self.ax.set_ylabel('North south degrees')
+        self.ax.plot([W_LIMIT, W_LIMIT, E_LIMIT, E_LIMIT], [S_LIMIT, N_LIMIT, N_LIMIT, S_LIMIT], 'b-', lw='2')
+        sql = 'delete from PulsarStatus'
+        self.db.query(sql)
+        dbg('Delete all in PulsarStatus')
+        for line in pulsarlist.keys():
+          name = line
+          attr = pulsarlist[line]
+          pulsar = Pulsar(name, self.obs)
+          if pulsar.visible_eye == True:
+            if pulsar.visible_tel == True:
+              self.ax.plot(pulsar.ewd, pulsar.nsd, 'bo')
+            else:
+              self.ax.plot(pulsar.ewd, pulsar.nsd, 'ro')
+            pulsarstatus[name] = [pulsar.ewd, pulsar.nsd]
+
+            sql = "insert into PulsarStatus values('"+name+"',"+str(pulsar.ewd)+","+str(pulsar.nsd)+")"
+            dbg('Append pulsar %s: %s'%(name, sql))
+            self.db.query(sql)
+
+          else:
+            self.ax.plot(pulsar.ewd, pulsar.nsd, 'gx')
+        self.fig.savefig('webgui/currentpulsars.png', dpi=PNG_DPI)
+        time.sleep(30)
+
+
+
 
 def plotPulsarsZenith(observer, antenna=None, timetable=None,epoch='2000'):
 
@@ -832,17 +859,17 @@ class fig():
 
 
 if __name__ == '__main__':
-  s = LiteSQL()
-  print 'All pulsars in database'
-  print pulsarlist.keys()
+  #s = LiteSQL()
+  #print 'All pulsars in database'
+  #print pulsarlist.keys()
 
-  date = '2013-7-30 02:00:00'
-  date = nowtime()
-  DATE = strtime2sec(date)
+  #date = '2013-7-30 02:00:00'
+  #date = nowtime()
+  #DATE = strtime2sec(date)
 
   
 
-  ob = Molonglo(date)
+  #ob = Molonglo(date)
 
   #p = Pulsar('J0437-4715', ob)
   #p.printPulsar()
