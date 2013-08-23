@@ -70,7 +70,8 @@ DEFAULT_PULSAR_DB_FILE = '.'+os.sep+'mol_pulsars.db'
 MYSQL_HOST = 'localhost'
 MYSQL_USER = 'scheduler'
 MYSQL_PASS = 'molonglo'
-MYSQL_DB = 'Molonglo'
+#MYSQL_PASS = 'MMypssqrl'
+MYSQL_DB = 'scheduler'
 
 # Slew rate, degrees per second
 EW_SLEW_RATE = 4.0 / 60.0
@@ -81,6 +82,10 @@ E_LIMIT = 15.0
 W_LIMIT = -15.0
 N_LIMIT = 53.37
 S_LIMIT = -90.0
+
+# Antenna view area
+EW_VIEW = 5.0
+NS_VIEW = 2.0
 
 # MOPSR IP and Port
 MOPSR_IP = '127.0.0.1'
@@ -228,236 +233,101 @@ def decdeg2rad(deg):
   return mark * np.deg2rad(absd+ m /60.0+ s /(60.0*60.0))
 
 
-class LiteSQL():
-  def __init__(self, txt=DEFAULT_PULSAR_TXT_FILE, status=DEFAULT_STATUS_TXT_FILE, db=DEFAULT_PULSAR_DB_FILE):
-    self.txt = txt
-    self.db = db
-    self.status = status
-    self.con = None
-    self.cur = None
-    self.checkdb()
-    self.readpulsarlist()
 
-  def checkdb(self):
-    exist = False
-    if os.path.isfile(self.db):
-      exist = True
-      out('Database file %s exists'% self.db)
-    self.con = lite.connect(self.db, check_same_thread = False)
-    self.cur = self.con.cursor()
-    if exist == False:
-      # Pulsar List
-      createtable = 'create table PulsarList(jname text primary key, raj text,decj text, s843 real, p0 real, w50 real, dm real, points_gain real, points_fail real, gap_min real, gap_max real, snr_min real, snr_min_tobs_max real, snr_max real )'
-      self.query(createtable)
-      # Observing Log
-      createtable = 'create table PulsarLog(jname text, tstart int, tobs int, succeed int, points int, snr real)'
-      self.query(createtable)
-      # Observing List
-      createtable = 'create table PulsarJobList(jname text, tstart int, tobs int)'
-      self.query(createtable)
-      # Statuses and Commands
-      createtable = 'create table Status(name text, taken int, scheduler_mode text, antenna_status text, antenna_position_ewd real, antenna_position_nsd real, mopsr_status text, tcc_status text, running int)'
-      self.query(createtable)
 
-      # System information
-      createtable = 'create table System(mopsr_ip text, mopsr_port int, tcc_ip text, tcc_port int)'
-      self.query(createtable)
+def query(sql):
+  con = mysql.connect(MYSQL_HOST, MYSQL_USER, MYSQL_PASS, MYSQL_DB)
+  with con:
+    cur = con.cursor()
+    cur.execute(sql)
+    result = cur.fetchall()
+  return result
 
-      # Pulsars overhead status
-      createtable = 'create table PulsarStatus(jname text, ewd real, nsd real)'
-      self.query(createtable)
+def preparedb():
+  result = query("show tables like 'PulsarList'")
+  if len(result)==0:
+    initdb()
+  readpulsarlist()
 
-      out('Database file %s not exists, created'% self.db)
-      self.testdata()
-      self.initpulsarlist()
-      self.initstatus()
 
-  def query(self, sql):
-    if self.con != None:
-      self.cur.execute(sql)
-      res = self.cur.fetchall()
-      self.con.commit()
-      #dbg('Query %s'% sql)
-      if len(res)>0:
-        return res
-      else:
-        return None
+
+def initdb():
+  createtable = 'create table PulsarList(jname varchar(250), raj varchar(250),decj varchar(250), s843 float, p0 float, w50 float, dm float, points_gain float, points_fail float, gap_min float, gap_max float, snr_min float, snr_min_tobs_max float, snr_max float , primary key(jname))'
+  query(createtable)
+  # Observing Log
+  createtable = 'create table PulsarLog(jname varchar(250), tstart datetime, tobs float, succeed bool, points float, snr float, comment varchar(250))'
+  query(createtable)
+  # Observing List
+  createtable = 'create table PulsarJobList(jname varchar(250), tstart datetime, tobs float, observing bool)'
+  query(createtable)
+  # Statuses and Commands
+  createtable = 'create table Status(name varchar(250), taken bool, scheduler_mode varchar(250), antenna_status varchar(250), antenna_position_ewd float, antenna_position_nsd float, mopsr_status varchar(250), tcc_status varchar(250), running bool)'
+  query(createtable)
+
+  # System information
+  createtable = 'create table System(mopsr_ip varchar(250), mopsr_port int, tcc_ip varchar(250), tcc_port int)'
+  query(createtable)
+
+  # Pulsars overhead status
+  createtable = 'create table PulsarStatus(jname varchar(250), ewd float, nsd float)'
+  query(createtable)
+
+  out('Database does not exist, created')
+  #self.testdata()
+  initpulsarlist()
+  initstatus()
+
+
+
+def initpulsarlist():
+  f = file(DEFAULT_PULSAR_TXT_FILE)
+  sql = "delete from PulsarList"
+  query(sql)
+  while True:
+    line = f.readline()
+    if len(line)!=0:
+      if line[0]=='#':
+        continue
+      templist = line.replace('*','NULL')
+      templist = templist.split(' ')
+      templist[-1] = templist[-1].replace('\n','')
+      sql = "insert into PulsarList values('"+templist[0]+"','"+templist[1]+"','"+templist[2]+"',"+str(templist[3])+","+str(templist[4])+","+str(templist[5])+","+str(templist[6])+","+str(templist[7])+","+str(templist[8])+","+str(templist[9])+","+str(templist[10])+","+str(templist[11])+","+str(templist[12])+","+str(templist[13])+");"
+      #dbg(sql)
+      query(sql)
+      dbg('Loaded pulsar: '+templist[0])
     else:
-      out('Database not exists, please check')
-
-
-  def testdata(self):
-    self.query("insert into PulsarList values('JTEST','12:00:00','45:00:00',34.56,12.3,4.32,126.7,100,-200,1,3,20,60,100);")
-    res = self.query("select * from PulsarList where jname='JTEST';")
-    for row in res:
-      print 'Test data:'
-      print row
-    self.query("delete from PulsarList where jname='JTEST'")
-
-  def initpulsarlist(self):
-    f = file(self.txt)
-    while True:
-      line = f.readline()
-      if len(line)!=0:
-        if line[0]=='#':
-          continue
-        templist = line.replace('*','NULL')
-        templist = templist.split(' ')
-        templist[-1] = templist[-1].replace('\n','')
-        sql = "insert into PulsarList values('"+templist[0]+"','"+templist[1]+"','"+templist[2]+"',"+str(templist[3])+","+str(templist[4])+","+str(templist[5])+","+str(templist[6])+","+str(templist[7])+","+str(templist[8])+","+str(templist[9])+","+str(templist[10])+","+str(templist[11])+","+str(templist[12])+","+str(templist[13])+");"
-        #dbg(sql)
-        self.query(sql)
-        dbg('Loaded pulsar: '+templist[0])
-      else:
-        break
-
-  def initstatus(self):
-    f = file(self.status)
-    while True:
-      line = f.readline()
-      if len(line)!=0:
-        if line[0]=='#':
-          continue
-        templist = line.replace('*','NULL')
-        templist = templist.split(' ')
-        templist[-1] = templist[-1].replace('\n','')
-        sql = "insert into Status values('"+templist[0]+"',"+str(templist[1])+",'"+templist[2]+"','"+templist[3]+"',"+str(templist[4])+","+str(templist[5])+",'"+templist[6]+"','"+templist[7]+"','"+templist[8]+"');"
-        dbg(sql)
-        self.query(sql)
-        dbg('Loaded status: '+templist[0])
-      else:
-        break
-
-  def readpulsarlist(self):
-    rows = self.query('select * from PulsarList;')
-    for row in rows:
-      pulsarlist[str(row[0])] = [str(row[1]), str(row[2]), row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11], row[12], row[13] ]
-
-  def update(self, table, column, value,wherecolumn, wherevalue):
-    sql = "update "+ table + " set " + column + "='" + value + "' where " + wherecolumn + "='" + wherevalue + "';"
-    self.query(sql)
-    dbg(sql)
-
-  def __del__(self):
-    dbg('LiteSQL delete')
-    self.con.commit()
-    self.con.close()
+      break
 
 
 
-
-
-
-class MySQL():
-  def __init__(self, txt=DEFAULT_PULSAR_TXT_FILE, status=DEFAULT_STATUS_TXT_FILE):
-    self.txt = txt
-    self.status = status
-    self.con = None
-    self.cur = None
-    self.checkdb()
-    self.readpulsarlist()
-
-  def checkdb(self):
-    self.con = mysql.connect(MYSQL_HOST, MYSQL_USER, MYSQL_PASS, MYSQL_DB)
-    self.cur = self.con.cursor()
-    result = self.query("show tables like 'PulsarList'")
-    if len(result)==0:
-      # Pulsar List
-      createtable = 'create table PulsarList(jname text primary key, raj text,decj text, s843 real, p0 real, w50 real, dm real, points_gain real, points_fail real, gap_min real, gap_max real, snr_min real, snr_min_tobs_max real, snr_max real )'
-      self.query(createtable)
-      # Observing Log
-      createtable = 'create table PulsarLog(jname text, tstart int, tobs int, succeed int, points int, snr real)'
-      self.query(createtable)
-      # Observing List
-      createtable = 'create table PulsarJobList(jname text, tstart int, tobs int)'
-      self.query(createtable)
-      # Statuses and Commands
-      createtable = 'create table Status(name text, taken int, scheduler_mode text, antenna_status text, antenna_position_ewd real, antenna_position_nsd real, mopsr_status text, tcc_status text, running int)'
-      self.query(createtable)
-
-      # System information
-      createtable = 'create table System(mopsr_ip text, mopsr_port int, tcc_ip text, tcc_port int)'
-      self.query(createtable)
-
-      # Pulsars overhead status
-      createtable = 'create table PulsarStatus(jname text, ewd real, nsd real)'
-      self.query(createtable)
-
-      out('Database file %s not exists, created'% self.db)
-      #self.testdata()
-      self.initpulsarlist()
-      self.initstatus()
-
-  def query(self, sql):
-    if self.con != None:
-      self.cur.execute(sql)
-      res = self.cur.fetchall()
-      self.con.commit()
-      #dbg('Query %s'% sql)
-      if len(res)>0:
-        return res
-      else:
-        return None
+def initstatus():
+  f = file(DEFAULT_STATUS_TXT_FILE)
+  sql = "delete from Status"
+  query(sql)
+  while True:
+    line = f.readline()
+    if len(line)!=0:
+      if line[0]=='#':
+        continue
+      templist = line.replace('*','NULL')
+      templist = templist.split(' ')
+      templist[-1] = templist[-1].replace('\n','')
+      sql = "insert into Status values('"+templist[0]+"',"+str(templist[1])+",'"+templist[2]+"','"+templist[3]+"',"+str(templist[4])+","+str(templist[5])+",'"+templist[6]+"','"+templist[7]+"','"+templist[8]+"');"
+      dbg(sql)
+      query(sql)
+      dbg('Loaded status: '+templist[0])
     else:
-      out('Database not exists, please check')
+      break
 
+def readpulsarlist():
+  rows = query('select * from PulsarList;')
+  for row in rows:
+    pulsarlist[str(row[0])] = [str(row[1]), str(row[2]), row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11], row[12], row[13] ]
 
-  def testdata(self):
-    self.query("insert into PulsarList values('JTEST','12:00:00','45:00:00',34.56,12.3,4.32,126.7,100,-200,1,3,20,60,100);")
-    res = self.query("select * from PulsarList where jname='JTEST';")
-    for row in res:
-      print 'Test data:'
-      print row
-    self.query("delete from PulsarList where jname='JTEST'")
-
-  def initpulsarlist(self):
-    f = file(self.txt)
-    while True:
-      line = f.readline()
-      if len(line)!=0:
-        if line[0]=='#':
-          continue
-        templist = line.replace('*','NULL')
-        templist = templist.split(' ')
-        templist[-1] = templist[-1].replace('\n','')
-        sql = "insert into PulsarList values('"+templist[0]+"','"+templist[1]+"','"+templist[2]+"',"+str(templist[3])+","+str(templist[4])+","+str(templist[5])+","+str(templist[6])+","+str(templist[7])+","+str(templist[8])+","+str(templist[9])+","+str(templist[10])+","+str(templist[11])+","+str(templist[12])+","+str(templist[13])+");"
-        #dbg(sql)
-        self.query(sql)
-        dbg('Loaded pulsar: '+templist[0])
-      else:
-        break
-
-  def initstatus(self):
-    f = file(self.status)
-    while True:
-      line = f.readline()
-      if len(line)!=0:
-        if line[0]=='#':
-          continue
-        templist = line.replace('*','NULL')
-        templist = templist.split(' ')
-        templist[-1] = templist[-1].replace('\n','')
-        sql = "insert into Status values('"+templist[0]+"',"+str(templist[1])+",'"+templist[2]+"','"+templist[3]+"',"+str(templist[4])+","+str(templist[5])+",'"+templist[6]+"','"+templist[7]+"','"+templist[8]+"');"
-        dbg(sql)
-        self.query(sql)
-        dbg('Loaded status: '+templist[0])
-      else:
-        break
-
-  def readpulsarlist(self):
-    rows = self.query('select * from PulsarList;')
-    for row in rows:
-      pulsarlist[str(row[0])] = [str(row[1]), str(row[2]), row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11], row[12], row[13] ]
-
-  def update(self, table, column, value,wherecolumn, wherevalue):
-    sql = "update "+ table + " set " + column + "='" + value + "' where " + wherecolumn + "='" + wherevalue + "';"
-    self.query(sql)
-    dbg(sql)
-
-  def __del__(self):
-    dbg('LiteSQL delete')
-    self.con.commit()
-    self.con.close()
+def update(table, column, value,wherecolumn, wherevalue):
+  sql = "update "+ table + " set " + column + "='" + value + "' where " + wherecolumn + "='" + wherevalue + "';"
+  query(sql)
+  dbg(sql)
 
 
 
@@ -685,58 +555,68 @@ class Scheduler():
 
     global pulsarlist, joblist, running, scheduler_mode, antenna_status, mopsr_status, tcc_status, antenna_position_ewd, antenna_position_nsd
     global message_to_mopsr,message_from_mopsr,message_to_tcc,message_from_tcc
-    self.db = LiteSQL()
-    print 'Scheduler DB: ',self.db
+    preparedb()
+    
     self.systemstatus = False
     self.systemtest()
     self.observatory = Molonglo()
     self.client = Client()
     self.client.start()
-    self.drawmap = DrawMap(self.observatory, self.db)
+    self.drawmap = DrawMap(self.observatory)
     self.drawmap.start()
-    self.status = StatusDealer(self.db)
+    self.status = StatusDealer()
     self.status.start()
     while True:
       self.systemtest()
       if self.systemstatus:
         joblist = []
         sql = "select * from PulsarJobList"
-        results = self.db.query(sql)
+        results = query(sql)
         for row in results:
           joblist.append(row[0])
-        out('Joblist', False)
-        dbg(joblist)
+        #out('Joblist', False)
+        #dbg(joblist)
+        if len(joblist)>0:
+                                      
+          source = joblist[0]
+          sql = "update PulsarJobList set observing=1 where jname='"+source+"'"
+          query(sql)
+          curp = SimplePoint(antenna_position_ewd, antenna_position_nsd)
+          t_timetable = gotime(curp, self.observatory)
+          t_sourcet = t_timetable[source][0] / 60.0
+          t_dest = t_timetable[source][1]
+          out('Begin observing schedule on %s'%source)
+          sendMessageToTCC('Move to %s'%(str(t_dest.ewd)+str(t_dest.nsd) ))
+          out('Antenna is slewing')
+          #while tcc_status!='tracking':
+          #  out('.', False)
+          #  time.sleep(1)
+          antenna_position_ewd = t_dest.ewd
+          antenna_position_nsd = t_dest.nsd
+          sql = "update Status set antenna_position_ewd="+str(antenna_position_ewd)+",antenna_position_nsd="+str(antenna_position_nsd)+" where name='status'"
+          dbg(sql)
+          query(sql)
+          sendMessageToMOPSR('recording')
+          mopsr_status = 'recording'
+          out('MOPSR is preparing')
+          while mopsr_status!='recording' and self.systemstatus:
+            self.systemtest()
+            out('.', False)
+            time.sleep(1)
 
-
-        source = joblist[0]
-        joblist.remove(source)
-        sql = "delete from PulsarJobList where jname='"+source+"'"
-        self.db.query(sql)
-        curp = SimplePoint(antenna_position_ewd, antenna_position_nsd)
-        t_timetable = gotime(curp, self.observatory)
-        t_sourcet = t_timetable[source][0] / 60.0
-        t_dest = t_timetable[source][1]
-        out('Begin observing schedule on %s'%source)
-        sendMessageToTCC('Move to %s'%(str(t_dest.ewd)+str(t_dest.nsd) ))
-        out('Antenna is slewing')
-        #while tcc_status!='tracking':
-        #  out('.', False)
-        #  time.sleep(1)
-        sendMessageToMOPSR('recording')
-        mopsr_status = 'recording'
-        out('MOPSR is preparing')
-        while mopsr_status!='recording' and self.systemstatus:
-          self.systemtest()
-          out('.', False)
-          time.sleep(1)
-
-        temptobs = int(t_timetable[source][3])+20
-        while self.systemstatus and temptobs > 0:
-          out('.')
-          self.systemtest()
-          temptobs = temptobs - 1
-          time.sleep(1)
-        mopsr_status = 'finish'
+          temptobs = int(t_timetable[source][3])+20
+          while self.systemstatus and temptobs > 0:
+            out('.')
+            self.systemtest()
+            temptobs = temptobs - 1
+            time.sleep(1)
+          mopsr_status = 'finish'
+          sql = "delete from PulsarJobList where jname='"+source+"'"
+          query(sql)
+          joblist.remove(source)
+        else:
+          out('Job list is empty')
+          time.sleep(1)      
 
       else:
         out('Something wrong')
@@ -826,16 +706,15 @@ def XMLWriter(who, action, attr):
     return et.tostring(tmpdom)
 
 class StatusDealer(threading.Thread):
-  def __init__(self, db):
+  def __init__(self):
     threading.Thread.__init__(self)
-    self.db = db
-    time.sleep(3.3)
+    #time.sleep(3.3)
 
   def run(self):
     global mopsr_status, tcc_status, antenna_status, running, antenna_position_ewd, antenna_position_nsd
     while True:
       sql = "select * from Status where name='command' and taken=1"
-      results = self.db.query(sql)
+      results = query(sql)
       #dbg('Results:%d'%results)
       if results!=None:
         for row in results:
@@ -846,9 +725,9 @@ class StatusDealer(threading.Thread):
           antenna_position_ewd = row['antenna_position_ewd']
           antenna_position_nsd = row['antenna_position_nsd']
         sql = "update Status set taken=0 where name='command'"
-        self.db.query(sql)
-      sql = "update Status set scheduler_mode='"+scheduler_mode+"', mopsr_status='"+mopsr_status+"', tcc_status='"+tcc_status+"', antenna_status='"+antenna_status+"', running='"+str(running)+"', antenna_position_ewd="+str(antenna_position_ewd)+", antenna_position_nsd="+str(antenna_position_nsd)+" where name='status'"
-      self.db.query(sql)
+        query(sql)
+      sql = "update Status set scheduler_mode='"+scheduler_mode+"', mopsr_status='"+mopsr_status+"', tcc_status='"+tcc_status+"', antenna_status='"+antenna_status+"', running='"+str(int(running))+"', antenna_position_ewd="+str(antenna_position_ewd)+", antenna_position_nsd="+str(antenna_position_nsd)+" where name='status'"
+      query(sql)
       time.sleep(2)
       
 
@@ -881,11 +760,9 @@ def makejoblist(event):
 
 
 class DrawMap(threading.Thread):
-  def __init__(self, obs, db):
+  def __init__(self, obs):
     threading.Thread.__init__(self)
     self.obs = obs
-    self.db = db
-    print 'DrawMap DB: ',self.db
     self.fig = plt.figure(figsize=(12,10))
     self.ax = plt.axes([0.05,0.05,0.9,0.9])
     self.ax.set_aspect(1)
@@ -893,7 +770,7 @@ class DrawMap(threading.Thread):
 
 
   def run(self):
-    global running, pulsarstatus
+    global running, pulsarstatus, antenna_position_ewd, antenna_position_nsd
     while True:
       if running:
         
@@ -906,8 +783,13 @@ class DrawMap(threading.Thread):
         self.ax.set_ylabel('North south degrees')
         self.ax.plot([W_LIMIT, W_LIMIT, E_LIMIT, E_LIMIT], [S_LIMIT, N_LIMIT, N_LIMIT, S_LIMIT], 'b-', lw='2')
         sql = 'delete from PulsarStatus'
-        self.db.query(sql)
-        dbg('Delete all in PulsarStatus')
+        query(sql)
+        #dbg('Delete all in PulsarStatus')
+        sql = "select antenna_position_ewd,antenna_position_nsd from Status where name='status'"
+        results = query(sql)
+        antenna_position_ewd = results[0][0]
+        antenna_position_nsd = results[0][1]
+        self.ax.plot([antenna_position_ewd-EW_VIEW/2, antenna_position_ewd-EW_VIEW/2, antenna_position_ewd+EW_VIEW/2, antenna_position_ewd+EW_VIEW/2, antenna_position_ewd-EW_VIEW/2], [antenna_position_nsd-NS_VIEW/2, antenna_position_nsd+NS_VIEW/2, antenna_position_nsd+NS_VIEW/2, antenna_position_nsd-NS_VIEW/2, antenna_position_nsd-NS_VIEW/2], 'r-', lw='1')
         for line in pulsarlist.keys():
           name = line
           attr = pulsarlist[line]
@@ -918,15 +800,17 @@ class DrawMap(threading.Thread):
             else:
               self.ax.plot(pulsar.ewd, pulsar.nsd, 'ro')
             pulsarstatus[name] = [pulsar.ewd, pulsar.nsd]
-
+            self.ax.text(pulsar.ewd+1, pulsar.nsd-2.4, name, fontsize='9')
             sql = "insert into PulsarStatus values('"+name+"',"+str(pulsar.ewd)+","+str(pulsar.nsd)+")"
-            dbg('Append pulsar %s: %s'%(name, sql))
-            self.db.query(sql)
+            #dbg('Append pulsar %s: %s'%(name, sql))
+            query(sql)
 
           else:
             self.ax.plot(pulsar.ewd, pulsar.nsd, 'gx')
+            self.ax.text(pulsar.ewd+1, pulsar.nsd-2.4, name, fontsize='9')
         self.fig.savefig('webgui/currentpulsars.png', dpi=PNG_DPI)
-        time.sleep(30)
+        dbg("Drawing currentpulsars.png")
+        time.sleep(3)
 
 
 
